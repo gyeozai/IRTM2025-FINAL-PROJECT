@@ -329,31 +329,62 @@ async def generate_response(
         print(f"[INFO] Performing RAG search with query: '{search_query}' on docs: {selected_doc_ids}")
         
         try:
-            if hasattr(searcher, "set_language"):
-                searcher.set_language(_detect_query_language(search_query))
+            # -----------------------------
+            # Analyzer selection (auto + fallback)
+            # -----------------------------
+            q_has_zh = bool(re.search(r"[\u4e00-\u9fff]", search_query))
+            q_has_en = bool(re.search(r"[a-zA-Z]", search_query))
 
-            def run_search(current_query: str) -> List:
-                return searcher.search(current_query, k=NUM_PASSAGES * 3)
+            if q_has_zh and q_has_en:
+                analyzer_order = ["other", "zh", "en", "default"]
+            else:
+                primary = _detect_query_language(search_query)
+                if primary == "zh":
+                    analyzer_order = ["zh", "other", "en", "default"]
+                elif primary == "en":
+                    analyzer_order = ["en", "other", "default"]
+                else:
+                    analyzer_order = [primary, "other", "default"]
 
-            # Step 4.5.2: BM25 搜尋（取 NUM_PASSAGES * 2 以確保過濾後有足夠結果）
-            # 先嘗試原始查詢
-            hits = searcher.search(search_query, k=NUM_PASSAGES * 3)
-            hits = run_search(search_query)
-            
-            # 如果原始查詢沒有結果，嘗試去掉底線的變體（處理底線不一致問題）
-            if len(hits) == 0 and "_" in search_query:
-                # 使用去掉底線的查詢
-                search_query = search_query.replace("_", " ")
-                hits = searcher.search(search_query, k=NUM_PASSAGES * 3)
-                hits = run_search(search_query)
-                print(f"[INFO] Retrying search with query without underscore: '{search_query}'")
-            
-            # 中英文同時支援：若無結果且包含英文內容，嘗試切換成英文查詢分析器
-            if len(hits) == 0 and hasattr(searcher, "set_language") and re.search(r"[a-zA-Z]", search_query):
-                searcher.set_language("en")
-                hits = run_search(search_query)
-                print("[INFO] Retrying search with English analyzer")
+            # Query variants (handle underscore mismatch like "16_flat_clustering" vs "16 flat clustering")
+            query_variants = [search_query]
+            if "_" in search_query:
+                query_variants.append(search_query.replace("_", " "))
 
+            def _run_search(q: str):
+                return searcher.search(q, k=NUM_PASSAGES * 3)
+
+            hits = []
+            analyzer_used = None
+            query_used = None
+
+            for analyzer in analyzer_order:
+                if analyzer != "default" and hasattr(searcher, "set_language"):
+                    try:
+                        searcher.set_language(analyzer)
+                    except Exception as e:
+                        print(f"[WARNING] set_language('{analyzer}') failed: {e}")
+
+                for qv in query_variants:
+                    hits = _run_search(qv)
+                    if hits:
+                        analyzer_used = analyzer
+                        query_used = qv
+                        break
+                if hits:
+                    break
+
+            if not hits and hasattr(searcher, "set_language"):
+                try:
+                    searcher.set_language("other")
+                    hits = _run_search(search_query)
+                    if hits:
+                        analyzer_used = "other"
+                        query_used = search_query
+                except Exception:
+                    pass
+
+            print(f"[INFO] Search analyzer used: {analyzer_used}, query used: {query_used}, hits: {len(hits)}")
             valid_chunks = []
             
             for hit in hits:
@@ -463,4 +494,3 @@ def truncate_response(text: str, limit: int) -> str:
     words = text.split()
     if len(words) <= limit: return text
     return " ".join(words[:limit]) + "..."
-

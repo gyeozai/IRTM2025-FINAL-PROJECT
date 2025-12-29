@@ -30,6 +30,32 @@ def _detect_language(text: str) -> str:
             return language
     return "en"
 
+
+def _detect_languages_in_text(text: str) -> set:
+    """
+    回傳文字中可能出現的語言集合
+    """
+    if not text:
+        return set()
+
+    langs = set()
+    for language, pattern in LANGUAGE_REGEX.items():
+        if pattern.search(text):
+            langs.add(language)
+    return langs
+
+
+def _choose_index_language(langs: set) -> str:
+    if not langs:
+        return "en"
+    if "zh" in langs and "en" in langs:
+        return "other"
+    if "zh" in langs:
+        return "zh"
+    if "en" in langs:
+        return "en"
+    return next(iter(langs))
+
 # ================= 設定區 =================
 # 取得 backend 的根目錄路徑
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -164,7 +190,7 @@ class DocumentService:
                 json.dump(record, f, ensure_ascii=False)
                 f.write("\n") # JSONL 格式要求每筆資料換行
 
-        # 6. 觸發索引更新 (Indexing) - 檢查 pyserini 是否可用
+        # 6. 索引更新時需檢查 pyserini 是否可用
         try:
             import pyserini
             PYSERINI_AVAILABLE = True
@@ -176,10 +202,8 @@ class DocumentService:
             index_success = self._run_pyserini_indexing()
             if not index_success:
                 print("[WARNING] Indexing failed, but file upload succeeded.")
-                # 不拋出異常，讓上傳成功，只是索引失敗
         else:
             print("[INFO] Skipping indexing (Pyserini not available). File uploaded successfully.")
-            # 索引不可用時，仍然返回成功
 
         return {
             "id": doc_id,
@@ -277,54 +301,111 @@ class DocumentService:
             
         return chunks
 
+    
     def _run_pyserini_indexing(self) -> bool:
+        """        Rebuild (or build) the Lucene index from JSONL chunks using Pyserini.
+
+        Key fixes:
+        - Use *the current interpreter* (sys.executable) so the venv-installed pyserini is found.
+          (Your log shows it was calling the system Python -> ModuleNotFoundError: pyserini)
+        - Auto-detect language across **all** documents/chunks.
+          * If both Chinese and English are detected => use 'other' analyzer (mixed-language).
+          * If only one language is detected => use that language analyzer.
+          * If detection fails => fall back to default analyzer.
+        - Try a small analyzer fallback chain to be robust.
         """
-        呼叫 subprocess 執行 Pyserini 指令
-        """
-        index_language = "en"
+        import sys
+
+        # ---------- 1) Detect index language over ALL jsonl files ----------
+        languages_found = set()
         try:
             if os.path.exists(JSONL_DIR):
-                for filename in os.listdir(JSONL_DIR):
-                    if not filename.endswith(".json"):
+                for fname in os.listdir(JSONL_DIR):
+                    if not fname.endswith(".json"):
                         continue
-                    jsonl_path = os.path.join(JSONL_DIR, filename)
-                    with open(jsonl_path, "r", encoding="utf-8") as file_handle:
-                        for line in file_handle:
+                    fp = os.path.join(JSONL_DIR, fname)
+                    with open(fp, "r", encoding="utf-8") as fh:
+                        for line in fh:
                             try:
-                                record = json.loads(line)
-                                contents = record.get("contents", "")
-                                detected_language = _detect_language(contents)
-                                if detected_language != "en":
-                                    index_language = detected_language
-                                    raise StopIteration
+                                rec = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
+                            contents = rec.get("contents", "") or ""
+                            lang = _detect_language(contents)
+                            if lang:
+                                languages_found.add(lang)
+                            # early stop if mixed already
+                            if "zh" in languages_found and "en" in languages_found:
+                                raise StopIteration
         except StopIteration:
             pass
         except Exception as e:
-            print(f"[WARNING] Failed to detect index language, defaulting to English: {e}")
+            print(f"[WARNING] Language detection failed, will fall back to default analyzer: {e}")
+            languages_found = set()
 
-        cmd = [
-            "python", "-m", "pyserini.index.lucene",
+        # normalize: only keep analyzers we intend to use
+        # pyserini supports many, but for our use we mainly care about zh/en/other.
+        if "zh" in languages_found and "en" in languages_found:
+            detected = "other"   # mixed-language documents
+        elif "zh" in languages_found:
+            detected = "zh"
+        elif "en" in languages_found:
+            detected = "en"
+        else:
+            detected = "default"
+
+        # ---------- 2) Build base command ----------
+        # IMPORTANT: use sys.executable (venv python) instead of plain "python"
+        base_cmd = [
+            sys.executable, "-m", "pyserini.index.lucene",
             "--collection", "JsonCollection",
             "--input", "data/jsonl",
             "--index", "data/indexes/lucene-index",
             "--generator", "DefaultLuceneDocumentGenerator",
-            "--language", index_language,
             "--threads", "1",
-            "--storePositions", "--storeDocvectors", "--storeRaw"
+            "--storePositions", "--storeDocvectors", "--storeRaw",
         ]
-        
+
+        # ---------- 3) Analyzer fallback chain ----------
+        # 'default' means: do NOT pass --language at all (let Lucene default analyzer decide)
+        analyzer_candidates = []
+        if detected == "default":
+            analyzer_candidates = ["default", "en", "other"]
+        elif detected == "other":
+            analyzer_candidates = ["other", "zh", "en", "default"]
+        else:
+            # single-language index
+            analyzer_candidates = [detected, "other", "default"]
+
         print(f"[INFO] Starting Indexing... Target: {JSONL_DIR}")
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, cwd=BASE_DIR)
-            
-            if result.returncode == 0:
-                print("[INFO] Indexing Success!")
-                return True
-            else:
-                print(f"[ERROR] Indexing Failed:\n{result.stderr}")
-                return False
-        except Exception as e:
-            print(f"[ERROR] Subprocess error: {e}")
-            return False
+        print(f"[INFO] Languages found: {sorted(languages_found) if languages_found else 'N/A'}")
+        print(f"[INFO] Detected analyzer: {detected}")
+
+        last_err = ""
+        for analyzer in analyzer_candidates:
+            cmd = list(base_cmd)
+            if analyzer != "default":
+                cmd += ["--language", analyzer]
+
+            print(f"[INFO] Indexing with language analyzer: {analyzer if analyzer != 'default' else '(auto/default)'}")
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, cwd=BASE_DIR)
+
+                if result.returncode == 0:
+                    print("[INFO] Indexing Success!")
+                    return True
+
+                # show stderr for debugging, but keep going
+                last_err = (result.stderr or result.stdout or "").strip()
+                print("[WARNING] Indexing attempt failed. Trying next analyzer...")
+                if last_err:
+                    print(last_err[:2000])
+
+            except Exception as e:
+                last_err = str(e)
+                print(f"[WARNING] Subprocess error: {e}. Trying next analyzer...")
+
+        print("[ERROR] Indexing Failed after fallbacks:")
+        if last_err:
+            print(last_err[:4000])
+        return False

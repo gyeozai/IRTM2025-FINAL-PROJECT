@@ -4,6 +4,8 @@
 
 RAGify is a NotebookLM-lite system that enables conversational interactions with documents through Retrieval-Augmented Generation (RAG). This project consists of two main components: experimental analysis and system implementation.
 
+[Check out the DEMO](https://drive.google.com/drive/folders/1U5GHvozSkr7AK2dsbWbvqYyJm4xLe4Oz?usp=sharing)
+
 ## Project Overview
 
 RAGify combines document retrieval with large language models to provide accurate, source-grounded answers. Instead of generating answers purely from a model's memory, RAG retrieves relevant documents first, then generates answers based on those documents, reducing hallucination and improving reliability.
